@@ -1,10 +1,10 @@
 // ==WindhawkMod==
 // @id              desktop-icon-hide-labels
 // @name            Hide Desktop Icon Labels
-// @description     Hides desktop icon label text and shrinks the selection/focus highlight to fit the icon only.
-// @version         2.0.0
+// @description     Hides desktop icon labels and makes the selection highlight a uniform square centered on the icon.
+// @version         2.1.0
 // @author          YourName
-// @github          https://github.com/YourName
+// @github          https://github.com/zoneill2
 // @include         explorer.exe
 // @architecture    x86-64
 // ==/WindhawkMod==
@@ -38,15 +38,59 @@ static WNDPROC g_origDefViewProc = nullptr;
 static volatile bool g_inDesktopPaint = false;
 static volatile int  g_iconOffsetY    = 0;
 
+// Queried icon dimensions (from the ListView's image list).
+static int g_iconW = 0;
+static int g_iconH = 0;
+
+// Padding around the icon for the square highlight.
+static const int HIGHLIGHT_PAD = 5;
+
+// The computed square highlight side length: max(iconW, iconH) + 2*PAD
+static int g_highlightSide = 0;
+
 // Track the current item's full cell rect from CUSTOMDRAW so we can
 // identify which FillRect/BitBlt calls correspond to the full cell
 // vs the text strip.
 static RECT g_currentCellRect = {};
 static bool g_haveItemRect    = false;
 
+// The desired square highlight rect for the current item, centered
+// on the icon within the cell.
+static RECT g_squareHighlight = {};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+static void QueryIconSize(HWND lv) {
+    // Ask the ListView for its large-icon image list and read its icon size.
+    HIMAGELIST hIml = reinterpret_cast<HIMAGELIST>(
+        CallWindowProcW(g_origLVProc, lv, LVM_GETIMAGELIST, LVSIL_NORMAL, 0));
+    if (hIml) {
+        // Dynamically resolve ImageList_GetIconSize to avoid comctl32.lib dependency.
+        using ImageList_GetIconSize_t = BOOL(WINAPI*)(HIMAGELIST, int*, int*);
+        static ImageList_GetIconSize_t pFunc = nullptr;
+        if (!pFunc) {
+            HMODULE hComctl = GetModuleHandleW(L"comctl32.dll");
+            if (hComctl)
+                pFunc = reinterpret_cast<ImageList_GetIconSize_t>(
+                    GetProcAddress(hComctl, "ImageList_GetIconSize"));
+        }
+        if (pFunc) {
+            int cx = 0, cy = 0;
+            if (pFunc(hIml, &cx, &cy)) {
+                g_iconW = cx;
+                g_iconH = cy;
+            }
+        }
+    }
+    // Fallback if image list query failed.
+    if (g_iconW <= 0) g_iconW = 48;
+    if (g_iconH <= 0) g_iconH = 48;
+
+    int maxDim = (g_iconW > g_iconH) ? g_iconW : g_iconH;
+    g_highlightSide = maxDim + 2 * HIGHLIGHT_PAD;
+}
+
 static int ComputeLabelHeight(HWND lv) {
     RECT rcLabel  = { LVIR_LABEL  };
     RECT rcBounds = { LVIR_BOUNDS };
@@ -58,17 +102,36 @@ static int ComputeLabelHeight(HWND lv) {
     return h > 0 ? h : 0;
 }
 
+// Compute the centered square highlight rect for an item given its
+// CUSTOMDRAW cell rect.  The icon is horizontally centered in the cell
+// and sits at the top; we want a square centered on the icon.
+static RECT ComputeSquareHighlight(const RECT& cell) {
+    int cellW  = cell.right  - cell.left;
+    int cellH  = cell.bottom - cell.top;
+    // The icon area is the cell minus the label height at the bottom.
+    int iconAreaH = cellH - g_iconOffsetY;
+    if (iconAreaH < 0) iconAreaH = cellH;
+
+    // Center of the icon area.
+    int cx = cell.left + cellW / 2;
+    int cy = cell.top  + iconAreaH / 2;
+
+    int half = g_highlightSide / 2;
+    RECT sq;
+    sq.left   = cx - half;
+    sq.top    = cy - half;
+    sq.right  = cx + half;
+    sq.bottom = cy + half;
+    return sq;
+}
+
 // Check if a rect roughly matches the current cell rect dimensions.
-// We use this to identify the "full cell" FillRect that paints the
-// highlight background behind icon + label.
 static bool IsFullCellRect(const RECT* r) {
     if (!g_haveItemRect || !r) return false;
     int cellW = g_currentCellRect.right  - g_currentCellRect.left;
     int cellH = g_currentCellRect.bottom - g_currentCellRect.top;
     int rW = r->right  - r->left;
     int rH = r->bottom - r->top;
-    // Allow some tolerance since the FillRect may be slightly larger
-    // than the CUSTOMDRAW rc (padding).
     return (rW >= cellW - 4 && rH >= cellH - 4 &&
             rW <= cellW + 20 && rH <= cellH + 20);
 }
@@ -101,23 +164,18 @@ static void* GetFillRectAddr() {
 }
 
 int WINAPI FillRect_Hook(HDC hdc, const RECT* lprc, HBRUSH hbr) {
-    if (g_inDesktopPaint && lprc && g_iconOffsetY > 0) {
+    if (g_inDesktopPaint && lprc && g_iconOffsetY > 0 && g_haveItemRect) {
         int w = lprc->right  - lprc->left;
         int h = lprc->bottom - lprc->top;
 
         // Suppress text-strip fills entirely.
         if (IsTextStripRect(w, h)) {
-            return 1;  // Pretend success, draw nothing.
+            return 1;
         }
 
-        // Shrink full-cell fills to exclude the label area.
+        // Replace full-cell fills with the square highlight.
         if (IsFullCellRect(lprc)) {
-            RECT shrunk = *lprc;
-            shrunk.bottom -= g_iconOffsetY;
-            if (shrunk.bottom > shrunk.top) {
-                return FillRect_Original(hdc, &shrunk, hbr);
-            }
-            return 1;
+            return FillRect_Original(hdc, &g_squareHighlight, hbr);
         }
     }
     return FillRect_Original(hdc, lprc, hbr);
@@ -138,18 +196,23 @@ static void* GetBitBltAddr() {
 
 BOOL WINAPI BitBlt_Hook(HDC hdcDest, int x, int y, int w, int h,
                          HDC hdcSrc, int x1, int y1, DWORD rop) {
-    if (g_inDesktopPaint && g_iconOffsetY > 0) {
+    if (g_inDesktopPaint && g_iconOffsetY > 0 && g_haveItemRect) {
         // Suppress text-strip blits.
         if (IsTextStripRect(w, h)) {
             return TRUE;
         }
 
-        // Shrink full-cell blits to exclude label area.
+        // Replace full-cell blits with the square highlight region.
         if (IsFullCellBlit(w, h)) {
-            int newH = h - g_iconOffsetY;
-            if (newH > 0) {
-                return BitBlt_Original(hdcDest, x, y, w, newH,
-                                       hdcSrc, x1, y1, rop);
+            int sqW = g_squareHighlight.right  - g_squareHighlight.left;
+            int sqH = g_squareHighlight.bottom - g_squareHighlight.top;
+            if (sqW > 0 && sqH > 0) {
+                return BitBlt_Original(hdcDest,
+                    g_squareHighlight.left, g_squareHighlight.top,
+                    sqW, sqH,
+                    hdcSrc,
+                    g_squareHighlight.left, g_squareHighlight.top,
+                    rop);
             }
             return TRUE;
         }
@@ -182,6 +245,7 @@ static LRESULT CALLBACK DesktopLVSubclassProc(HWND hwnd, UINT msg,
     case WM_PAINT:
     case WM_PRINTCLIENT: {
         g_iconOffsetY    = ComputeLabelHeight(hwnd);
+        QueryIconSize(hwnd);
         g_haveItemRect   = false;
         g_inDesktopPaint = true;
         LRESULT r = CallWindowProcW(g_origLVProc, hwnd, msg, wParam, lParam);
@@ -214,17 +278,17 @@ static LRESULT CALLBACK DefViewSubclassProc(HWND hwnd, UINT msg,
                 return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
 
             case CDDS_ITEMPREPAINT: {
-                // Capture the cell rect so our hooks can identify
-                // which GDI calls belong to the full cell vs text strip.
+                // Capture the original cell rect for matching in hooks.
                 g_currentCellRect = cd->nmcd.rc;
                 g_haveItemRect    = true;
 
-                // Shrink the CUSTOMDRAW rc to exclude the label area.
-                // This tells the ListView to draw the highlight/focus
-                // rect only around the icon, not the label.
-                if (g_iconOffsetY > 0) {
-                    cd->nmcd.rc.bottom -= g_iconOffsetY;
-                }
+                // Compute the centered square highlight for this item.
+                g_squareHighlight = ComputeSquareHighlight(cd->nmcd.rc);
+
+                // Override the CUSTOMDRAW rc to the square so the
+                // ListView draws the highlight/focus rect as a square
+                // centered on the icon.
+                cd->nmcd.rc = g_squareHighlight;
 
                 return CDRF_NOTIFYPOSTPAINT;
             }
@@ -285,7 +349,7 @@ static void TrySubclassDesktopWindows() {
 // Mod lifecycle
 // ---------------------------------------------------------------------------
 BOOL Wh_ModInit() {
-    Wh_Log(L"desktop-icon-hide-labels v2.0.0 init");
+    Wh_Log(L"desktop-icon-hide-labels v2.1.0 init");
 
     if (!Wh_SetFunctionHook(
             reinterpret_cast<void*>(DrawTextW),
