@@ -3,7 +3,7 @@
 // @name            Hide Desktop Icon Labels
 // @description     Hides desktop icon labels and makes the selection highlight a uniform square centered on the icon.
 // @version         2.1.0
-// @author          YourName
+// @author          zoneill
 // @github          https://github.com/zoneill2
 // @include         explorer.exe
 // @architecture    x86-64
