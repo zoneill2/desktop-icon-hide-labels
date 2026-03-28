@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              desktop-icon-hide-labels
 // @name            Hide Desktop Icon Labels
-// @description     Hides the text labels beneath desktop icons and centers the icon within its cell.
-// @version         1.3.0
+// @description     Hides desktop icon label text and shrinks the selection/focus highlight to fit the icon only.
+// @version         2.0.0
 // @author          YourName
 // @github          https://github.com/YourName
 // @include         explorer.exe
@@ -13,18 +13,14 @@
 /*
 # Hide Desktop Icon Labels
 
-Hides the text name labels displayed beneath desktop icons, leaving only the
-icons themselves visible. The icon is vertically centered within the full item
-cell so the selection highlight and click hit-testing both wrap the icon.
+Hides the text labels beneath desktop icons and resizes the
+selection/focus highlight rectangle so it wraps only the icon image,
+not the label area below it.
 
-Tooltips still work on hover, and the actual file/shortcut names are **not**
-changed in any way.
-
-## Notes
-
-- Works on Windows 10 and Windows 11.
-- The mod targets `explorer.exe` only.
-- Right-click the desktop and choose Refresh if icons don't update immediately.
+Text is suppressed by intercepting DrawTextW during desktop ListView
+paint cycles. The highlight is resized by adjusting FillRect and BitBlt
+calls that cover the full icon cell, shrinking them by the computed
+label height (iconOffsetY).
 */
 // ==/WindhawkModReadme==
 
@@ -39,160 +35,160 @@ static WNDPROC g_origLVProc      = nullptr;
 static HWND    g_defView         = nullptr;
 static WNDPROC g_origDefViewProc = nullptr;
 
-// Set to true while the desktop LV is executing a WM_PAINT / WM_PRINTCLIENT.
-// Used to gate both the DrawText suppression and the ImageList_DrawEx offset.
-thread_local bool g_inDesktopPaint = false;
+static volatile bool g_inDesktopPaint = false;
+static volatile int  g_iconOffsetY    = 0;
 
-// How many pixels to push the icon downward so it sits in the vertical center
-// of the full cell (icon + label area). Calculated fresh each paint from the
-// actual item geometry so it works at any DPI / icon size.
-thread_local int g_iconOffsetY = 0;
+// Track the current item's full cell rect from CUSTOMDRAW so we can
+// identify which FillRect/BitBlt calls correspond to the full cell
+// vs the text strip.
+static RECT g_currentCellRect = {};
+static bool g_haveItemRect    = false;
 
 // ---------------------------------------------------------------------------
-// Compute the vertical offset needed to center the icon in the full cell.
-// The desktop LV cell normally looks like:
-//
-//   [  top padding  ]
-//   [    ICON       ]   ← LVIR_ICON top/bottom
-//   [  gap          ]
-//   [   Label text  ]   ← LVIR_LABEL top/bottom
-//   [  bottom pad   ]
-//
-// With labels hidden we want the icon centered in the whole LVIR_BOUNDS rect.
+// Helpers
 // ---------------------------------------------------------------------------
-static int ComputeIconOffsetY(HWND lv) {
-    if (!lv) return 0;
-
-    // Use item 0 as the reference — all items have the same geometry.
+static int ComputeLabelHeight(HWND lv) {
+    RECT rcLabel  = { LVIR_LABEL  };
     RECT rcBounds = { LVIR_BOUNDS };
-    RECT rcIcon   = { LVIR_ICON   };
-
-    // Send directly to the original proc so we get the unpatched rects.
+    if (!CallWindowProcW(g_origLVProc, lv, LVM_GETITEMRECT, 0,
+                         reinterpret_cast<LPARAM>(&rcLabel)))  return 0;
     if (!CallWindowProcW(g_origLVProc, lv, LVM_GETITEMRECT, 0,
                          reinterpret_cast<LPARAM>(&rcBounds))) return 0;
-    if (!CallWindowProcW(g_origLVProc, lv, LVM_GETITEMRECT, 0,
-                         reinterpret_cast<LPARAM>(&rcIcon)))   return 0;
+    int h = rcBounds.bottom - rcLabel.top;
+    return h > 0 ? h : 0;
+}
 
-    int cellH  = rcBounds.bottom - rcBounds.top;
-    int iconH  = rcIcon.bottom   - rcIcon.top;
-    int iconTopInCell = rcIcon.top - rcBounds.top;  // current distance from top
+// Check if a rect roughly matches the current cell rect dimensions.
+// We use this to identify the "full cell" FillRect that paints the
+// highlight background behind icon + label.
+static bool IsFullCellRect(const RECT* r) {
+    if (!g_haveItemRect || !r) return false;
+    int cellW = g_currentCellRect.right  - g_currentCellRect.left;
+    int cellH = g_currentCellRect.bottom - g_currentCellRect.top;
+    int rW = r->right  - r->left;
+    int rH = r->bottom - r->top;
+    // Allow some tolerance since the FillRect may be slightly larger
+    // than the CUSTOMDRAW rc (padding).
+    return (rW >= cellW - 4 && rH >= cellH - 4 &&
+            rW <= cellW + 20 && rH <= cellH + 20);
+}
 
-    // Where we WANT the icon top to be (centered):
-    int wantedTopInCell = (cellH - iconH) / 2;
+// Check if dimensions match the full cell (for BitBlt).
+static bool IsFullCellBlit(int w, int h) {
+    if (!g_haveItemRect) return false;
+    int cellW = g_currentCellRect.right  - g_currentCellRect.left;
+    int cellH = g_currentCellRect.bottom - g_currentCellRect.top;
+    return (w >= cellW - 4 && h >= cellH - 4 &&
+            w <= cellW + 20 && h <= cellH + 20);
+}
 
-    return wantedTopInCell - iconTopInCell;  // positive = shift down
+// Check if this is a text-strip operation (small, height ~ iconOffsetY).
+static bool IsTextStripRect(int w, int h) {
+    return g_iconOffsetY > 0 && h > 0 && h <= g_iconOffsetY + 4 && w < 200;
 }
 
 // ---------------------------------------------------------------------------
-// Hook: ImageList_DrawEx
-// comctl32 calls this to stamp the icon bitmap at a specific (x,y).
-// We intercept it and shift y by g_iconOffsetY when inside a desktop paint.
-// Loaded dynamically to avoid a comctl32.lib linker dependency.
+// Hook: FillRect
+//   - Full cell rect: shrink height by iconOffsetY (shrink highlight)
+//   - Text strip rect: suppress entirely (no label background)
 // ---------------------------------------------------------------------------
-using ImageList_DrawEx_t = BOOL(WINAPI*)(HIMAGELIST, int, HDC,
-                                          int, int, int, int,
-                                          COLORREF, COLORREF, UINT);
-ImageList_DrawEx_t ImageList_DrawEx_Original;
+using FillRect_t = int(WINAPI*)(HDC, const RECT*, HBRUSH);
+FillRect_t FillRect_Original;
 
-static void* GetImageList_DrawExAddr() {
-    HMODULE hComctl = LoadLibraryW(L"comctl32.dll");
-    if (!hComctl) return nullptr;
-    return reinterpret_cast<void*>(GetProcAddress(hComctl, "ImageList_DrawEx"));
+static void* GetFillRectAddr() {
+    HMODULE h = LoadLibraryW(L"user32.dll");
+    return h ? reinterpret_cast<void*>(GetProcAddress(h, "FillRect")) : nullptr;
 }
 
-BOOL WINAPI ImageList_DrawEx_Hook(HIMAGELIST himl, int i, HDC hdcDst,
-                                   int x, int y, int dx, int dy,
-                                   COLORREF rgbBk, COLORREF rgbFg, UINT fStyle) {
-    if (g_inDesktopPaint) {
-        y += g_iconOffsetY;
+int WINAPI FillRect_Hook(HDC hdc, const RECT* lprc, HBRUSH hbr) {
+    if (g_inDesktopPaint && lprc && g_iconOffsetY > 0) {
+        int w = lprc->right  - lprc->left;
+        int h = lprc->bottom - lprc->top;
+
+        // Suppress text-strip fills entirely.
+        if (IsTextStripRect(w, h)) {
+            return 1;  // Pretend success, draw nothing.
+        }
+
+        // Shrink full-cell fills to exclude the label area.
+        if (IsFullCellRect(lprc)) {
+            RECT shrunk = *lprc;
+            shrunk.bottom -= g_iconOffsetY;
+            if (shrunk.bottom > shrunk.top) {
+                return FillRect_Original(hdc, &shrunk, hbr);
+            }
+            return 1;
+        }
     }
-    return ImageList_DrawEx_Original(himl, i, hdcDst,
-                                     x, y, dx, dy, rgbBk, rgbFg, fStyle);
+    return FillRect_Original(hdc, lprc, hbr);
 }
 
 // ---------------------------------------------------------------------------
-// Hook: DrawTextW — suppress label text during desktop paint
+// Hook: BitBlt
+//   - Full cell blit: shrink h by iconOffsetY
+//   - Text strip blit: suppress entirely
+// ---------------------------------------------------------------------------
+using BitBlt_t = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, DWORD);
+BitBlt_t BitBlt_Original;
+
+static void* GetBitBltAddr() {
+    HMODULE h = LoadLibraryW(L"gdi32.dll");
+    return h ? reinterpret_cast<void*>(GetProcAddress(h, "BitBlt")) : nullptr;
+}
+
+BOOL WINAPI BitBlt_Hook(HDC hdcDest, int x, int y, int w, int h,
+                         HDC hdcSrc, int x1, int y1, DWORD rop) {
+    if (g_inDesktopPaint && g_iconOffsetY > 0) {
+        // Suppress text-strip blits.
+        if (IsTextStripRect(w, h)) {
+            return TRUE;
+        }
+
+        // Shrink full-cell blits to exclude label area.
+        if (IsFullCellBlit(w, h)) {
+            int newH = h - g_iconOffsetY;
+            if (newH > 0) {
+                return BitBlt_Original(hdcDest, x, y, w, newH,
+                                       hdcSrc, x1, y1, rop);
+            }
+            return TRUE;
+        }
+    }
+    return BitBlt_Original(hdcDest, x, y, w, h, hdcSrc, x1, y1, rop);
+}
+
+// ---------------------------------------------------------------------------
+// Hook: DrawTextW — suppress all text during desktop paint
 // ---------------------------------------------------------------------------
 using DrawTextW_t = int(WINAPI*)(HDC, LPCWSTR, int, LPRECT, UINT);
 DrawTextW_t DrawTextW_Original;
 
 int WINAPI DrawTextW_Hook(HDC hdc, LPCWSTR lpchText, int cchText,
                           LPRECT lprc, UINT format) {
-    if (g_inDesktopPaint) return 0;
+    if (g_inDesktopPaint) {
+        // Suppress all text drawing. Return a plausible height so
+        // callers doing DT_CALCRECT get a non-zero value.
+        return g_iconOffsetY > 0 ? g_iconOffsetY : 16;
+    }
     return DrawTextW_Original(hdc, lpchText, cchText, lprc, format);
 }
 
 // ---------------------------------------------------------------------------
-// Hook: DrawTextExW — suppress label text during desktop paint
-// ---------------------------------------------------------------------------
-using DrawTextExW_t = int(WINAPI*)(HDC, LPWSTR, int, LPRECT, UINT,
-                                   LPDRAWTEXTPARAMS);
-DrawTextExW_t DrawTextExW_Original;
-
-int WINAPI DrawTextExW_Hook(HDC hdc, LPWSTR lpchText, int cchText,
-                            LPRECT lprc, UINT format, LPDRAWTEXTPARAMS lpdtp) {
-    if (g_inDesktopPaint) return 0;
-    return DrawTextExW_Original(hdc, lpchText, cchText, lprc, format, lpdtp);
-}
-
-// ---------------------------------------------------------------------------
-// Desktop SysListView32 subclass proc
+// Desktop SysListView32 subclass
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK DesktopLVSubclassProc(HWND hwnd, UINT msg,
                                                WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_PAINT:
     case WM_PRINTCLIENT: {
-        // Compute the offset once per paint pass (uses item 0 geometry).
-        g_iconOffsetY    = ComputeIconOffsetY(hwnd);
+        g_iconOffsetY    = ComputeLabelHeight(hwnd);
+        g_haveItemRect   = false;
         g_inDesktopPaint = true;
         LRESULT r = CallWindowProcW(g_origLVProc, hwnd, msg, wParam, lParam);
         g_inDesktopPaint = false;
+        g_haveItemRect   = false;
         return r;
     }
-
-    // Shrink BOUNDS / SELECTBOUNDS to the re-centered icon rect so that
-    // the selection highlight box and hit-test match the visual icon position.
-    case LVM_GETITEMRECT: {
-        RECT* prc  = reinterpret_cast<RECT*>(lParam);
-        if (!prc) break;
-        int code = prc->left;
-        int item = static_cast<int>(wParam);
-
-        // Get un-patched rects from the real proc
-        RECT rcBounds = { LVIR_BOUNDS };
-        RECT rcIcon   = { LVIR_ICON   };
-        LRESULT rb = CallWindowProcW(g_origLVProc, hwnd, LVM_GETITEMRECT,
-                                     item, reinterpret_cast<LPARAM>(&rcBounds));
-        LRESULT ri = CallWindowProcW(g_origLVProc, hwnd, LVM_GETITEMRECT,
-                                     item, reinterpret_cast<LPARAM>(&rcIcon));
-        if (!rb || !ri) break;
-
-        int cellH  = rcBounds.bottom - rcBounds.top;
-        int cellW  = rcBounds.right  - rcBounds.left;
-        int iconH  = rcIcon.bottom   - rcIcon.top;
-        int iconW  = rcIcon.right    - rcIcon.left;
-
-        // Centered icon rect in screen coords
-        int newTop  = rcBounds.top  + (cellH - iconH) / 2;
-        int newLeft = rcBounds.left + (cellW - iconW) / 2;
-        RECT rcCentered = { newLeft, newTop, newLeft + iconW, newTop + iconH };
-
-        switch (code) {
-        case LVIR_ICON:
-        case LVIR_BOUNDS:
-        case LVIR_SELECTBOUNDS:
-            *prc = rcCentered;
-            return TRUE;
-        case LVIR_LABEL:
-            // Zero-height rect — nothing to click or draw
-            *prc = { rcCentered.left,  rcCentered.bottom,
-                     rcCentered.right, rcCentered.bottom };
-            return TRUE;
-        }
-        break;
-    }
-
     case WM_DESTROY:
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(g_origLVProc));
@@ -200,14 +196,12 @@ static LRESULT CALLBACK DesktopLVSubclassProc(HWND hwnd, UINT msg,
         g_origLVProc = nullptr;
         break;
     }
-
     return CallWindowProcW(g_origLVProc, hwnd, msg, wParam, lParam);
 }
 
 // ---------------------------------------------------------------------------
-// SHELLDLL_DefView subclass — only needed so NM_CUSTOMDRAW CDDS_PREPAINT
-// returns CDRF_NOTIFYITEMDRAW (keeps custom draw pipeline alive) without
-// us needing to do any manual drawing.
+// DefView subclass — intercept NM_CUSTOMDRAW to track item rects
+// and shrink the highlight at ITEMPREPAINT.
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK DefViewSubclassProc(HWND hwnd, UINT msg,
                                              WPARAM wParam, LPARAM lParam) {
@@ -215,15 +209,40 @@ static LRESULT CALLBACK DefViewSubclassProc(HWND hwnd, UINT msg,
         NMHDR* hdr = reinterpret_cast<NMHDR*>(lParam);
         if (hdr && hdr->hwndFrom == g_desktopLV && hdr->code == NM_CUSTOMDRAW) {
             NMLVCUSTOMDRAW* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
-            if (cd->nmcd.dwDrawStage == CDDS_PREPAINT)
-                return CDRF_NOTIFYITEMDRAW;
+            switch (cd->nmcd.dwDrawStage) {
+            case CDDS_PREPAINT:
+                return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
+
+            case CDDS_ITEMPREPAINT: {
+                // Capture the cell rect so our hooks can identify
+                // which GDI calls belong to the full cell vs text strip.
+                g_currentCellRect = cd->nmcd.rc;
+                g_haveItemRect    = true;
+
+                // Shrink the CUSTOMDRAW rc to exclude the label area.
+                // This tells the ListView to draw the highlight/focus
+                // rect only around the icon, not the label.
+                if (g_iconOffsetY > 0) {
+                    cd->nmcd.rc.bottom -= g_iconOffsetY;
+                }
+
+                return CDRF_NOTIFYPOSTPAINT;
+            }
+
+            case CDDS_ITEMPOSTPAINT:
+                g_haveItemRect = false;
+                return CDRF_DODEFAULT;
+
+            default:
+                break;
+            }
         }
     }
     return CallWindowProcW(g_origDefViewProc, hwnd, msg, wParam, lParam);
 }
 
 // ---------------------------------------------------------------------------
-// Find desktop windows and install subclasses
+// Find and subclass
 // ---------------------------------------------------------------------------
 static void TrySubclassDesktopWindows() {
     if (g_desktopLV) return;
@@ -253,12 +272,12 @@ static void TrySubclassDesktopWindows() {
     g_origLVProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(lv, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(DesktopLVSubclassProc)));
-
     g_defView         = defView;
     g_origDefViewProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(defView, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(DefViewSubclassProc)));
 
+    Wh_Log(L"Subclassed lv=%p defView=%p", lv, defView);
     InvalidateRect(lv, nullptr, TRUE);
 }
 
@@ -266,29 +285,28 @@ static void TrySubclassDesktopWindows() {
 // Mod lifecycle
 // ---------------------------------------------------------------------------
 BOOL Wh_ModInit() {
-    Wh_Log(L"desktop-icon-hide-labels: ModInit v1.3");
+    Wh_Log(L"desktop-icon-hide-labels v2.0.0 init");
 
     if (!Wh_SetFunctionHook(
             reinterpret_cast<void*>(DrawTextW),
             reinterpret_cast<void*>(DrawTextW_Hook),
             reinterpret_cast<void**>(&DrawTextW_Original))) {
-        Wh_Log(L"Failed to hook DrawTextW"); return FALSE;
+        Wh_Log(L"Failed to hook DrawTextW");
+        return FALSE;
     }
-    if (!Wh_SetFunctionHook(
-            reinterpret_cast<void*>(DrawTextExW),
-            reinterpret_cast<void*>(DrawTextExW_Hook),
-            reinterpret_cast<void**>(&DrawTextExW_Original))) {
-        Wh_Log(L"Failed to hook DrawTextExW"); return FALSE;
+
+    void* pFillRect = GetFillRectAddr();
+    if (pFillRect) {
+        Wh_SetFunctionHook(pFillRect,
+            reinterpret_cast<void*>(FillRect_Hook),
+            reinterpret_cast<void**>(&FillRect_Original));
     }
-    void* pImageList_DrawEx = GetImageList_DrawExAddr();
-    if (!pImageList_DrawEx) {
-        Wh_Log(L"Failed to find ImageList_DrawEx"); return FALSE;
-    }
-    if (!Wh_SetFunctionHook(
-            pImageList_DrawEx,
-            reinterpret_cast<void*>(ImageList_DrawEx_Hook),
-            reinterpret_cast<void**>(&ImageList_DrawEx_Original))) {
-        Wh_Log(L"Failed to hook ImageList_DrawEx"); return FALSE;
+
+    void* pBitBlt = GetBitBltAddr();
+    if (pBitBlt) {
+        Wh_SetFunctionHook(pBitBlt,
+            reinterpret_cast<void*>(BitBlt_Hook),
+            reinterpret_cast<void**>(&BitBlt_Original));
     }
 
     TrySubclassDesktopWindows();
@@ -300,17 +318,19 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModUninit() {
-    Wh_Log(L"desktop-icon-hide-labels: ModUninit");
+    Wh_Log(L"desktop-icon-hide-labels: uninit");
 
     if (g_defView && g_origDefViewProc) {
         SetWindowLongPtrW(g_defView, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(g_origDefViewProc));
-        g_defView = nullptr; g_origDefViewProc = nullptr;
+        g_defView = nullptr;
+        g_origDefViewProc = nullptr;
     }
     if (g_desktopLV && g_origLVProc) {
         SetWindowLongPtrW(g_desktopLV, GWLP_WNDPROC,
                           reinterpret_cast<LONG_PTR>(g_origLVProc));
         InvalidateRect(g_desktopLV, nullptr, TRUE);
-        g_desktopLV = nullptr; g_origLVProc = nullptr;
+        g_desktopLV  = nullptr;
+        g_origLVProc = nullptr;
     }
 }
